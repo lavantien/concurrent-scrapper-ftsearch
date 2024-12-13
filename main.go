@@ -2,16 +2,24 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/temoto/robotstxt"
 	"golang.org/x/net/html"
@@ -19,49 +27,51 @@ import (
 
 type InputType string
 
-const (
-	SearchQuery InputType = "searchQuery"
-	URLInput    InputType = "urlInput"
+var (
+	focusedStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	blurredStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	cursorStyle         = focusedStyle
+	noStyle             = lipgloss.NewStyle()
+	helpStyle           = blurredStyle
+	cursorModeHelpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+	focusedButton = focusedStyle.Render("[ Submit ]")
+	blurredButton = fmt.Sprintf("[ %s ]", blurredStyle.Render("Submit"))
 )
 
+type WorkerLog struct {
+	WorkerID    int
+	URL         string
+	ProcessTime time.Duration
+	StartTime   time.Time
+}
+
 type Model struct {
-	db            *sql.DB
-	urlQueue      URLQueue
-	results       chan FetchResult
-	wg            sync.WaitGroup
-	sem           Semaphore
-	numWorkers    int
-	activeWorkers int
-	urlInput      textinput.Model
-	searchInput   textinput.Model
-	focusedInput  InputType // Track which input field is focused
+	db       *sql.DB
+	urlQueue chan string
+	results  chan FetchResult
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+
+	inputs     []textinput.Model
+	focusIndex int
+	cursorMode cursor.Mode
+
 	searchResults []string
 	status        string
+	workerLogs    []WorkerLog
+
+	activeWorkers int32 // Use atomic for thread-safe counter
+	maxWorkers    int
 }
 
 type FetchResult struct {
-	URL   string
-	Body  []byte
-	Error error
-}
-
-type (
-	URLQueue  chan string
-	Semaphore chan struct{}
-	errMsg    error
-)
-
-func (s Semaphore) Acquire() {
-	s <- struct{}{}
-}
-
-func (s Semaphore) Release() {
-	<-s
-}
-
-// Check if the focused input is the search query.
-func (m *Model) IsSearchQueryFocused() bool {
-	return m.focusedInput == SearchQuery
+	URL         string
+	Body        []byte
+	Error       error
+	WorkerID    int
+	ProcessTime time.Duration
 }
 
 func initDB(dbPath string) (*sql.DB, error) {
@@ -94,29 +104,6 @@ func initDB(dbPath string) (*sql.DB, error) {
 	}
 
 	return db, nil
-}
-
-func fetcherWorker(queue URLQueue, results chan<- FetchResult, wg *sync.WaitGroup, activeWorkers *int) {
-	for url := range queue {
-		*activeWorkers++
-		resp, err := http.Get(url)
-		if err != nil {
-			results <- FetchResult{URL: url, Error: fmt.Errorf("failed to fetch URL %s: %v", url, err)}
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close() // Close the response body explicitly
-		if err != nil {
-			results <- FetchResult{URL: url, Error: fmt.Errorf("failed to read response body for URL %s: %v", url, err)}
-			continue
-		}
-
-		results <- FetchResult{URL: url, Body: body}
-		*activeWorkers--
-	}
-
-	wg.Done()
 }
 
 func parseHTML(body []byte) (string, error) {
@@ -235,182 +222,340 @@ func searchDB(db *sql.DB, keyword string) ([]string, error) {
 }
 
 func initModel(dbPath string) (*Model, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	db, err := initDB(dbPath)
 	if err != nil {
-		fmt.Printf("fail to init db %v\n", err)
+		cancel()
 		return nil, fmt.Errorf("failed to initialize database: %v", err)
 	}
 
-	urlQueue := make(URLQueue, 100)
-	results := make(chan FetchResult, 100)
+	// Recreate input fields with more detailed configuration
+	inputs := make([]textinput.Model, 2)
+	for i := range inputs {
+		t := textinput.New()
+		t.Cursor.Style = cursorStyle
+		t.CharLimit = 256
 
-	numWorkers := 10
-	sem := make(Semaphore, numWorkers)
+		switch i {
+		case 0:
+			t.Placeholder = "Enter URL"
+			t.Focus()
+			t.PromptStyle = focusedStyle
+			t.TextStyle = focusedStyle
+		case 1:
+			t.Placeholder = "Enter keyword"
+			t.Blur()
+			t.PromptStyle = noStyle
+			t.TextStyle = noStyle
+		}
 
-	tiURL := textinput.New()
-	tiURL.Placeholder = "Enter URL"
-	tiURL.Focus()
-	tiURL.CharLimit = 256
-	tiURL.Width = 100
-	tiSearch := textinput.New()
-	tiSearch.Placeholder = "Enter keyword"
-	tiSearch.CharLimit = 256
-	tiSearch.Width = 100
+		inputs[i] = t
+	}
 
 	model := &Model{
-		db:            db,
-		urlQueue:      urlQueue,
-		results:       results,
-		wg:            sync.WaitGroup{},
-		sem:           sem,
-		numWorkers:    numWorkers,
-		activeWorkers: 0,
-		urlInput:      tiURL,
-		searchInput:   tiSearch, // Initialize the search input field
-		focusedInput:  URLInput,
+		db:       db,
+		urlQueue: make(chan string, 100),
+		results:  make(chan FetchResult, 100),
+		ctx:      ctx,
+		cancel:   cancel,
+
+		inputs:     inputs,
+		focusIndex: 0,
+		cursorMode: cursor.CursorBlink,
+
 		searchResults: []string{},
-		status:        "Initializing...",
+		status:        "Ready",
+		activeWorkers: 0,
+		maxWorkers:    10,
+		workerLogs:    []WorkerLog{},
 	}
 
 	// Start fetcher workers
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < model.maxWorkers; i++ {
 		model.wg.Add(1)
-		go func() {
-			defer model.wg.Done()
-			model.sem.Acquire()
-			defer model.sem.Release()
-			fetcherWorker(model.urlQueue, model.results, &model.wg, &model.activeWorkers)
-		}()
+		go model.fetcherWorker(i + 1) // Use 1-based worker IDs
 	}
 
-	// Start parser and saver
-	go func() {
-		for result := range model.results {
-			if result.Error != nil {
-				model.status = fmt.Sprintf("Error fetching %s: %v", result.URL, result.Error)
-				fmt.Println("error", result.URL, result.Error)
-				continue
-			}
-
-			textContent, err := parseHTML(result.Body)
-			if err != nil {
-				model.status = fmt.Sprintf("Error parsing %s: %v", result.URL, err)
-				fmt.Println("fail to parse html", result.URL, err)
-				continue
-			}
-
-			allowed, err := isAllowed(result.URL)
-			if err != nil {
-				model.status = fmt.Sprintf("Error checking robots.txt for %s: %v\n", result.URL, err)
-				fmt.Println("fail to check robots", result.URL, err)
-				continue
-			}
-
-			if allowed {
-				err := saveToDB(model.db, result.URL, textContent)
-				if err != nil {
-					model.status = fmt.Sprintf("Error saving %s to database: %v", result.URL, err)
-					fmt.Println("fail to save db", result.URL, err)
-				}
-			}
-		}
-
-		close(results) // Close results channel after all fetcher workers have finished
-	}()
+	// Start result processor
+	go model.processResults()
 
 	return model, nil
 }
 
+func (m *Model) fetcherWorker(workerID int) {
+	defer m.wg.Done()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case url, ok := <-m.urlQueue:
+			if !ok {
+				return
+			}
+
+			atomic.AddInt32(&m.activeWorkers, 1)
+			result := m.fetchAndProcessURL(workerID, url)
+			m.results <- result
+			atomic.AddInt32(&m.activeWorkers, -1)
+		}
+	}
+}
+
+func (m *Model) fetchAndProcessURL(workerID int, urlStr string) FetchResult {
+	startTime := time.Now()
+
+	allowed, err := isAllowed(urlStr)
+	if err != nil {
+		return FetchResult{
+			URL:         urlStr,
+			Error:       err,
+			WorkerID:    workerID,
+			ProcessTime: time.Since(startTime),
+		}
+	}
+
+	if !allowed {
+		return FetchResult{
+			URL:         urlStr,
+			Error:       fmt.Errorf("not allowed by robots.txt"),
+			WorkerID:    workerID,
+			ProcessTime: time.Since(startTime),
+		}
+	}
+
+	// Simulate processing complexity
+	time.Sleep(500 * time.Millisecond)
+
+	resp, err := http.Get(urlStr)
+	if err != nil {
+		return FetchResult{
+			URL:         urlStr,
+			Error:       err,
+			WorkerID:    workerID,
+			ProcessTime: time.Since(startTime),
+		}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return FetchResult{
+			URL:         urlStr,
+			Error:       err,
+			WorkerID:    workerID,
+			ProcessTime: time.Since(startTime),
+		}
+	}
+
+	return FetchResult{
+		URL:         urlStr,
+		Body:        body,
+		WorkerID:    workerID,
+		ProcessTime: time.Since(startTime),
+	}
+}
+
+func (m *Model) processResults() {
+	for result := range m.results {
+		// Log worker performance
+		workerLog := WorkerLog{
+			WorkerID:    result.WorkerID,
+			URL:         result.URL,
+			ProcessTime: result.ProcessTime,
+			StartTime:   time.Now(),
+		}
+		m.workerLogs = append(m.workerLogs, workerLog)
+
+		// Limit log size to prevent memory growth
+		if len(m.workerLogs) > 50 {
+			m.workerLogs = m.workerLogs[len(m.workerLogs)-50:]
+		}
+
+		if result.Error != nil {
+			m.status = fmt.Sprintf("Worker %d Error: %s", result.WorkerID, result.Error)
+			continue
+		}
+
+		textContent, err := parseHTML(result.Body)
+		if err != nil {
+			m.status = fmt.Sprintf("Worker %d Parse Error: %v", result.WorkerID, err)
+			continue
+		}
+
+		err = saveToDB(m.db, result.URL, textContent)
+		if err != nil {
+			m.status = fmt.Sprintf("Worker %d DB Save Error: %v", result.WorkerID, err)
+		} else {
+			m.status = fmt.Sprintf("Worker %d processed %s in %v",
+				result.WorkerID, result.URL, result.ProcessTime)
+		}
+	}
+}
+
 func (m *Model) Init() tea.Cmd {
-	return nil
+	// Restore input initialization logic
+	cmds := make([]tea.Cmd, len(m.inputs))
+	for i := range m.inputs {
+		if i == m.focusIndex {
+			cmds[i] = m.inputs[i].Focus()
+			m.inputs[i].PromptStyle = focusedStyle
+			m.inputs[i].TextStyle = focusedStyle
+		} else {
+			m.inputs[i].Blur()
+			m.inputs[i].PromptStyle = noStyle
+			m.inputs[i].TextStyle = noStyle
+		}
+		cmds[i] = m.inputs[i].Cursor.SetMode(m.cursorMode)
+	}
+
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-
-	var url, keyword string
+	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			m.cancel()
 			m.wg.Wait()
 			close(m.urlQueue)
+			close(m.results)
 			return m, tea.Quit
-		case tea.KeyEnter:
-			// Only do action when Enter is pressed
-			if m.focusedInput == SearchQuery {
-				m.searchInput.Focus()
-				keyword = m.searchInput.Value()
-				if len(keyword) > 0 {
+
+		case "tab", "shift+tab", "up", "down":
+			s := msg.String()
+
+			if s == "up" || s == "shift+tab" {
+				m.focusIndex--
+			} else {
+				m.focusIndex++
+			}
+
+			// Wrap focus index
+			if m.focusIndex > len(m.inputs) {
+				m.focusIndex = 0
+			} else if m.focusIndex < 0 {
+				m.focusIndex = len(m.inputs)
+			}
+
+			return m, m.updateInputs(msg)
+
+		case "enter":
+			if m.focusIndex == 0 {
+				// URL Input
+				url := m.inputs[0].Value()
+				if url != "" {
+					m.urlQueue <- url
+					m.status = fmt.Sprintf("Added URL: %s", url)
+					m.inputs[0].Reset()
+				}
+			} else if m.focusIndex == 1 {
+				// Search Input
+				keyword := m.inputs[1].Value()
+				if keyword != "" {
 					results, err := searchDB(m.db, keyword)
 					if err != nil {
 						m.status = fmt.Sprintf("Search error: %v", err)
 					} else {
 						m.searchResults = results
-						m.status = fmt.Sprintf("Found %d results for '%s'", len(results), keyword)
+						m.status = fmt.Sprintf("Found %d results", len(results))
 					}
-				}
-			} else if m.focusedInput == URLInput {
-				m.urlInput.Focus()
-				url = m.urlInput.Value()
-				if len(url) > 0 {
-					m.urlQueue <- url
-					m.status = "URL added to queue"
+					m.inputs[1].Reset()
 				}
 			}
-		case tea.KeyTab:
-			// Toggle focus between input fields
-			if m.focusedInput == SearchQuery {
-				m.focusedInput = URLInput
-			} else {
-				m.focusedInput = SearchQuery
-			}
-		}
 
-	case errMsg:
-		fmt.Printf("error on input %v\n", msg)
-		return m, nil
+		case "ctrl+r":
+			// Cycle cursor mode
+			m.cursorMode++
+			if m.cursorMode > cursor.CursorHide {
+				m.cursorMode = cursor.CursorBlink
+			}
+
+			cmds := make([]tea.Cmd, len(m.inputs))
+			for i := range m.inputs {
+				cmds[i] = m.inputs[i].Cursor.SetMode(m.cursorMode)
+			}
+			return m, tea.Batch(cmds...)
+		}
 	}
 
-	// Update search query model
-	m.searchInput, _ = m.searchInput.Update(msg)
+	// Update input fields with focus management
+	cmd = m.updateInputs(msg)
+	cmds = append(cmds, cmd)
 
-	// Update url input model
-	m.urlInput, cmd = m.urlInput.Update(msg)
+	return m, tea.Batch(cmds...)
+}
 
-	return m, cmd
+func (m *Model) updateInputs(msg tea.Msg) tea.Cmd {
+	cmds := make([]tea.Cmd, len(m.inputs))
+
+	for i := range m.inputs {
+		if i == m.focusIndex {
+			m.inputs[i].PromptStyle = focusedStyle
+			m.inputs[i].TextStyle = focusedStyle
+			cmds[i] = m.inputs[i].Focus()
+		} else {
+			m.inputs[i].PromptStyle = noStyle
+			m.inputs[i].TextStyle = noStyle
+			m.inputs[i].Blur()
+		}
+
+		m.inputs[i], cmds[i] = m.inputs[i].Update(msg)
+	}
+
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) View() string {
 	var b strings.Builder
 
-	b.WriteString("Web Crawler TUI\n")
-
-	// URL Input Field
-	if m.IsSearchQueryFocused() {
-		b.WriteString("\nEnter keyword to search:\n")
-		b.WriteString(m.searchInput.View())
-	} else {
-		b.WriteString("\nEnter URL to crawl:\n")
-		b.WriteString(m.urlInput.View())
+	// Render inputs
+	for i := range m.inputs {
+		b.WriteString(m.inputs[i].View())
+		b.WriteRune('\n')
 	}
 
-	// Crawl Status
-	b.WriteString("\nCrawl Status:\n")
-	b.WriteString(fmt.Sprintf("Active Workers: %d/%d\n", m.activeWorkers, m.numWorkers))
-	b.WriteString(m.status + "\n")
+	// Render submit button
+	button := &blurredButton
+	if m.focusIndex == len(m.inputs) {
+		button = &focusedButton
+	}
+	fmt.Fprintf(&b, "\n%s\n", *button)
 
-	// Search Results
+	// Cursor mode help
+	b.WriteString(helpStyle.Render("cursor mode is "))
+	b.WriteString(cursorModeHelpStyle.Render(m.cursorMode.String()))
+	b.WriteString(helpStyle.Render(" (ctrl+r to change style)\n"))
+
+	// Status and workers
+	b.WriteString(fmt.Sprintf("\nStatus: %s\n", m.status))
+	b.WriteString(fmt.Sprintf("Active Workers: %d/%d\n", m.activeWorkers, m.maxWorkers))
+
+	// Search results
 	b.WriteString("\nSearch Results:\n")
 	for _, result := range m.searchResults {
 		b.WriteString(result + "\n")
 	}
 
-	// Debugging Information
-	b.WriteString("\nDebugging Information:\n")
-	b.WriteString(fmt.Sprintf("URL Queue Length: %d\n", len(m.urlQueue)))
-	b.WriteString(fmt.Sprintf("Results Channel Length: %d\n", len(m.results)))
+	// Enhanced worker logs display
+	b.WriteString("\nRecent Worker Activity:\n")
+	for _, log := range m.workerLogs {
+		b.WriteString(fmt.Sprintf(
+			"Worker %d: %s (processed in %v)\n",
+			log.WorkerID,
+			log.URL,
+			log.ProcessTime,
+		))
+	}
+
+	// Workers statistics
+	b.WriteString(fmt.Sprintf("\nActive Workers: %d/%d\n",
+		atomic.LoadInt32(&m.activeWorkers), m.maxWorkers))
 
 	return b.String()
 }
@@ -421,18 +566,39 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer model.cancel()
+	defer model.wg.Wait()
 	defer model.db.Close()
 
-	// Seed the queue with initial URLs
-	initialURLs := []string{"https://example.com"}
+	// Seed with multiple URLs to test concurrency
+	initialURLs := []string{
+		"https://en.wikipedia.org/wiki/List_of_programming_languages",
+		"https://github.com/explore",
+		"https://www.gutenberg.org/browse/scores/top",
+		"https://news.ycombinator.com",
+		"https://stackoverflow.com/questions",
+		"https://www.reddit.com/r/programming/",
+		"https://dev.to/",
+		"https://www.infoq.com/",
+		"https://hackernoon.com/",
+		"https://medium.com/topic/programming",
+	}
+
 	for _, url := range initialURLs {
 		model.urlQueue <- url
 	}
 
-	// Start Bubble Tea application
+	// Handle OS signals for graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		model.cancel()
+	}()
+
 	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v\n", err)
-		return
+		os.Exit(1)
 	}
 }
